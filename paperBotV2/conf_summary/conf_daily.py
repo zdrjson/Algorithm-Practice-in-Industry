@@ -1,24 +1,21 @@
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
+import sys
+import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import requests
-from tqdm import tqdm
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RESULTS_PATH = SCRIPT_DIR / "data" / "results.json"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.127 Safari/537.36"
-    ),
-    "Content-Type": "application/json",
-}
-
+STATE_PATH = SCRIPT_DIR / "data" / "push_state.json"
 DEFAULT_CONFS = ["kdd", "www", "cikm", "recsys", "wsdm", "sigir", "ecir"]
 PRIMARY_KEYWORDS = [
     "click-through", "recommend", "taobao", "ctr", "cvr", "conver", "match",
@@ -39,11 +36,22 @@ SECONDARY_KEYWORDS = [
 ]
 
 
-def parse_csv_env(name, default=None):
-    raw_value = os.environ.get(name)
-    if not raw_value:
-        return default or []
-    return [item.strip() for item in raw_value.split(",") if item.strip()]
+class ConfDailyError(RuntimeError):
+    """An expected configuration or delivery failure."""
+
+
+class ConfigurationError(ConfDailyError):
+    pass
+
+
+class DeliveryError(ConfDailyError):
+    pass
+
+
+def parse_csv(value):
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def env_bool(name, default=False):
@@ -54,253 +62,230 @@ def env_bool(name, default=False):
 
 
 def load_results(path=RESULTS_PATH):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as file_handle:
+            first_line = file_handle.readline()
+            if first_line.startswith("version https://git-lfs.github.com/spec/"):
+                raise ConfigurationError(
+                    f"{path} 仍是 Git LFS 指针；请先拉取 LFS 文件"
+                )
+            file_handle.seek(0)
+            results = json.load(file_handle)
+    except OSError as exc:
+        raise ConfigurationError(f"无法读取会议论文数据 {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ConfigurationError(f"会议论文数据不是有效 JSON: {path}") from exc
+
+    if not isinstance(results, dict):
+        raise ConfigurationError("会议论文数据顶层必须是 JSON 对象")
+    return results
 
 
-def save_results(results, path=RESULTS_PATH):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
+def load_state(path=STATE_PATH):
+    if not path.exists():
+        return {"version": 1, "sent_paper_ids": []}
+
+    try:
+        with open(path, "r", encoding="utf-8") as file_handle:
+            state = json.load(file_handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(f"无法读取推送状态 {path}: {exc}") from exc
+
+    if not isinstance(state, dict) or state.get("version") != 1:
+        raise ConfigurationError("推送状态文件版本无效")
+    sent_ids = state.get("sent_paper_ids")
+    if not isinstance(sent_ids, list) or not all(isinstance(item, str) for item in sent_ids):
+        raise ConfigurationError("推送状态中的 sent_paper_ids 必须是字符串数组")
+    return state
+
+
+def save_state(sent_paper_ids, path=STATE_PATH):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "version": 1,
+        "sent_paper_ids": sorted(set(sent_paper_ids)),
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
+    temp_path = None
+    try:
+        descriptor, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as file_handle:
+            json.dump(state, file_handle, indent=2, ensure_ascii=False)
+            file_handle.write("\n")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path is not None and temp_path.exists():
+            temp_path.unlink()
 
 
 def match_score(item):
-    title = item.get("paper_name", "").lower()
+    if not isinstance(item, dict):
+        return -1
+    title = str(item.get("paper_name") or "").lower()
     score = 0
     for keyword in PRIMARY_KEYWORDS:
-        if keyword.lower() in title:
+        if keyword in title:
             score += 1
     for keyword in SECONDARY_KEYWORDS:
-        if keyword.lower() in title:
+        if keyword in title:
             score += 0.25
     return score
 
 
-def fetch_private_paper(query, conf_url):
-    if not conf_url:
-        print("CONF_URL 未设置，跳过私有摘要补全")
-        return None
-
-    payload = {
-        "query": query,
-        "needDetails": True,
-        "page": 0,
-        "size": 20,
-        "filters": [],
-    }
-    try:
-        response = requests.post(
-            conf_url,
-            data=json.dumps(payload),
-            headers=HEADERS,
-            timeout=10,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except (requests.RequestException, ValueError) as exc:
-        print(f"请求 CONF_URL 失败: {exc}")
-        return None
-
-    hit_list = data.get("data", {}).get("hitList", [])
-    if not hit_list:
-        return None
-    return hit_list[0]
+def stable_paper_id(key, paper):
+    url = str(paper.get("paper_url") or "").strip()
+    title = " ".join(str(paper.get("paper_name") or "").split()).casefold()
+    identity = url or title
+    if not identity:
+        raise ValueError("paper_url 和 paper_name 不能同时为空")
+    digest = hashlib.sha256(
+        f"{key.casefold()}\0{identity}".encode("utf-8")
+    ).hexdigest()
+    return f"sha256:{digest}"
 
 
-def parse_private_paper(item):
-    authors = item.get("authors") or []
-    cleaned_authors = []
-    for author in authors:
-        if not isinstance(author, dict):
-            continue
-        cleaned_authors.append({
-            "name": author.get("name", ""),
-            "org": author.get("org", ""),
-            "orgId": author.get("orgId", ""),
-        })
+def select_candidates(results, sent_paper_ids, limits, confs, start_year, current_year=None):
+    selected = []
+    sent_ids = set(sent_paper_ids)
+    current_year = current_year or dt.datetime.now().year
 
-    abstract = (item.get("pubAbstract") or "").strip()
-    if not abstract:
-        return None
+    for year in range(current_year, start_year - 1, -1):
+        for conf in confs:
+            key = f"{conf.lower()}{year}"
+            papers = results.get(key)
+            if not isinstance(papers, list):
+                continue
 
-    return {
-        "authors_detail": cleaned_authors,
-        "paper_abstract": abstract,
-    }
+            ranked_papers = sorted(
+                enumerate(papers),
+                key=lambda entry: (-match_score(entry[1]), entry[0]),
+            )
+            for paper_index, paper in ranked_papers:
+                if len(selected) >= limits:
+                    return selected
+                if not isinstance(paper, dict):
+                    continue
+                abstract = paper.get("paper_abstract")
+                if not isinstance(abstract, str) or not abstract.strip():
+                    continue
+                try:
+                    paper_id = stable_paper_id(key, paper)
+                except ValueError:
+                    continue
+                if paper_id in sent_ids:
+                    continue
+                selected.append({
+                    "key": key,
+                    "paper_index": paper_index,
+                    "paper_id": paper_id,
+                    "paper": paper,
+                })
+
+    return selected
 
 
-def translate_with_deepseek(texts, api_key):
+def validate_feishu_urls(urls):
+    if not urls:
+        raise ConfigurationError("FEISHU_URL 未配置")
+    for index, url in enumerate(urls, start=1):
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ConfigurationError(f"FEISHU_URL 第 {index} 项不是有效的 HTTP(S) URL")
+
+
+def runtime_config():
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
     if not api_key:
-        print("DEEPSEEK_API_KEY 未设置，跳过摘要翻译")
-        return ["" for _ in texts]
+        raise ConfigurationError("DEEPSEEK_API_KEY 未配置")
+    feishu_urls = parse_csv(os.environ.get("FEISHU_URL", ""))
+    validate_feishu_urls(feishu_urls)
+    return api_key, feishu_urls
 
-    from openai import OpenAI
 
-    client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+def translate_with_deepseek(texts, api_key, model="deepseek-chat"):
+    if not api_key:
+        raise ConfigurationError("DEEPSEEK_API_KEY 未配置")
+    if not model.strip():
+        raise ConfigurationError("DeepSeek 模型名称不能为空")
+
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise ConfigurationError("缺少 openai 依赖，无法调用 DeepSeek") from exc
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com",
+        timeout=30,
+        max_retries=2,
+    )
     system_prompt = {
         "role": "system",
         "content": (
             "你是一位专业的翻译人员，擅长在人工智能领域内进行高质量的英文到中文翻译。"
-            "请准确翻译论文摘要，保留专业术语和技术细节。"
+            "请准确翻译论文摘要，保留专业术语和技术细节，只输出译文。"
         ),
     }
     translations = []
-    for text in texts:
+    for index, text in enumerate(texts, start=1):
         try:
             response = client.chat.completions.create(
-                model="deepseek-chat",
+                model=model,
                 messages=[system_prompt, {"role": "user", "content": text}],
-                temperature=1.3,
+                temperature=0.3,
                 stream=False,
             )
-            translations.append(response.choices[0].message.content.strip())
+            translated = response.choices[0].message.content
         except Exception as exc:
-            print(f"DeepSeek 翻译失败: {exc}")
-            translations.append("")
+            raise ConfDailyError(f"DeepSeek 翻译第 {index} 篇摘要失败: {exc}") from exc
+        if not isinstance(translated, str) or not translated.strip():
+            raise ConfDailyError(f"DeepSeek 翻译第 {index} 篇摘要返回空内容")
+        translations.append(translated.strip())
     return translations
-
-
-def translate_with_caiyun(texts, api_key):
-    if not api_key:
-        print("CAIYUN_TOKEN 未设置，跳过摘要翻译")
-        return ["" for _ in texts]
-
-    payload = {
-        "source": texts,
-        "trans_type": "en2zh",
-        "request_id": "conf_daily",
-        "detect": True,
-    }
-    headers = {
-        "content-type": "application/json",
-        "x-authorization": "token " + api_key,
-    }
-    try:
-        response = requests.post(
-            "http://api.interpreter.caiyunai.com/v1/translator",
-            data=json.dumps(payload),
-            headers=headers,
-            timeout=30,
-        )
-        response.raise_for_status()
-        targets = response.json().get("target", [])
-        if len(targets) == len(texts):
-            return targets
-    except (requests.RequestException, ValueError) as exc:
-        print(f"彩云翻译失败: {exc}")
-    return ["" for _ in texts]
-
-
-def translate_abstracts(texts, model_type):
-    if not texts:
-        return []
-    if model_type.lower() == "caiyun":
-        return translate_with_caiyun(texts, os.environ.get("CAIYUN_TOKEN", ""))
-    return translate_with_deepseek(texts, os.environ.get("DEEPSEEK_API_KEY", ""))
-
-
-def find_and_update_papers(results, conf_url, limits, interval, confs, start_year, dry_run):
-    selected = []
-    years = list(range(dt.datetime.now().year, start_year - 1, -1))
-
-    for year in years:
-        for conf in confs:
-            key = f"{conf}{year}"
-            papers = results.get(key)
-            if not papers:
-                continue
-
-            sorted_indexes = sorted(
-                range(len(papers)),
-                key=lambda idx: match_score(papers[idx]),
-                reverse=True,
-            )
-            for paper_index in sorted_indexes:
-                if len(selected) >= limits:
-                    return selected
-                paper = papers[paper_index]
-                if paper.get("paper_abstract", "").strip():
-                    continue
-
-                title = paper.get("paper_name", "")
-                print(f"开始补全论文摘要: {key} - {title}")
-                if dry_run:
-                    print("DRY_RUN=true，仅预览，不请求 CONF_URL")
-                    selected.append((key, paper_index, {"paper_abstract": "[DRY_RUN]"}))
-                    continue
-
-                private_item = fetch_private_paper(title, conf_url)
-                if private_item is None:
-                    print(f"未找到摘要: {title}")
-                    time.sleep(interval)
-                    continue
-
-                parsed_item = parse_private_paper(private_item)
-                if not parsed_item:
-                    print(f"解析摘要失败: {title}")
-                    time.sleep(interval)
-                    continue
-
-                selected.append((key, paper_index, parsed_item))
-                time.sleep(interval)
-
-    return selected
-
-
-def apply_updates(results, selected, model_type, dry_run):
-    if dry_run:
-        return selected
-
-    abstracts = [item["paper_abstract"] for _, _, item in selected]
-    translations = translate_abstracts(abstracts, model_type)
-    for idx, (_, _, item) in enumerate(selected):
-        translation = translations[idx] if idx < len(translations) else ""
-        item["abstract_translation"] = translation
-        item["translated"] = translation
-
-    for key, paper_index, item in selected:
-        results[key][paper_index].update(item)
-
-    return selected
 
 
 def get_org_text(paper):
     orgs = set()
-    for author in paper.get("authors_detail", []):
+    for author in paper.get("authors_detail") or []:
         if isinstance(author, dict) and author.get("org"):
-            orgs.add(author["org"].split(",")[0])
-    return "; ".join(sorted(orgs)) if orgs else "NA"
+            orgs.add(str(author["org"]).split(",")[0].strip())
+    return "; ".join(sorted(org for org in orgs if org)) or "NA"
 
 
-def build_message(key, paper, index, model_type):
-    today = dt.datetime.now().strftime("%Y-%m-%d")
-    title = paper.get("paper_name", "")
-    url = paper.get("paper_url", "#")
-    authors = "; ".join(paper.get("paper_authors", [])) or "NA"
-    org = get_org_text(paper)
-    summary = paper.get("paper_abstract", "")
-    translated = paper.get("abstract_translation") or paper.get("translated") or "NA"
+def get_authors_text(paper):
+    authors = paper.get("paper_authors") or []
+    if isinstance(authors, str):
+        return authors.strip() or "NA"
+    return "; ".join(str(author) for author in authors if author) or "NA"
 
+
+def build_message(key, paper, index, translation, model):
+    today = dt.datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
+    title = str(paper.get("paper_name") or "Untitled")
+    url = str(paper.get("paper_url") or "").strip()
+    title_text = f"[{title}]({url})" if url else title
+    summary = str(paper.get("paper_abstract") or "").strip()
     push_title = f"{key.upper()}[{index}]@{today}"
     content = (
-        f"[[{key.upper()}]{title}]({url})\n\n"
-        f"Author: {authors}\n\n"
-        f"ORG: {org}\n\n"
-        f"URL: {url}\n\n"
-        f"Translated (Powered by {model_type}):\n\n{translated}\n\n"
-        f"Summary:\n\n{summary}\n\n"
+        f"**{key.upper()}** · {title_text}\n\n"
+        f"**Author:** {get_authors_text(paper)}\n\n"
+        f"**ORG:** {get_org_text(paper)}\n\n"
+        f"**Translated (Powered by {model}):**\n\n{translation}\n\n"
+        f"**Original abstract:**\n\n{summary}"
     )
     return push_title, content
 
 
-def send_feishu_message(title, content, urls, dry_run):
+def send_feishu_message(title, content, urls, dry_run=False):
     if dry_run:
-        print(f"[DRY_RUN] 将发送飞书消息: {title}")
-        return
-    if not urls:
-        print("没有有效的 FEISHU_URL，跳过发送消息")
+        print(f"[DRY_RUN] {title}\n{content}\n")
         return
 
-    card_data = {
+    card = {
         "config": {"wide_screen_mode": True},
         "header": {
             "template": "green",
@@ -308,66 +293,142 @@ def send_feishu_message(title, content, urls, dry_run):
         },
         "elements": [{"tag": "markdown", "content": content}],
     }
-    body = json.dumps({"msg_type": "interactive", "card": json.dumps(card_data)})
-    headers = {"Content-Type": "application/json"}
+    payload = {"msg_type": "interactive", "card": card}
 
-    for idx, url in enumerate(urls):
+    for index, url in enumerate(urls, start=1):
+        host = urlparse(url).hostname or "unknown-host"
         try:
-            response = requests.post(url=url, data=body, headers=headers, timeout=10)
-            print(f"飞书推送[{idx + 1}/{len(urls)}]返回状态: {response.status_code}")
+            response = requests.post(url, json=payload, timeout=15)
+            response.raise_for_status()
+            response_data = response.json()
+        except requests.HTTPError as exc:
+            status_code = getattr(exc.response, "status_code", None)
+            status_text = str(status_code) if status_code is not None else "unknown"
+            raise DeliveryError(
+                f"飞书推送端点 {index}/{len(urls)} ({host}) HTTP 失败: "
+                f"status={status_text}"
+            ) from None
         except requests.RequestException as exc:
-            print(f"飞书推送[{idx + 1}/{len(urls)}]失败: {exc}")
+            raise DeliveryError(
+                f"飞书推送端点 {index}/{len(urls)} ({host}) 请求失败: "
+                f"type={type(exc).__name__}"
+            ) from None
+        except ValueError:
+            raise DeliveryError(
+                f"飞书推送端点 {index}/{len(urls)} ({host}) 返回 JSON 无效"
+            ) from None
+
+        if not isinstance(response_data, dict):
+            raise DeliveryError(
+                f"飞书推送端点 {index}/{len(urls)} ({host}) 返回格式无效"
+            )
+        business_code = response_data.get("code", response_data.get("StatusCode"))
+        if business_code not in (0, "0"):
+            raise DeliveryError(
+                f"飞书推送端点 {index}/{len(urls)} ({host}) 业务失败: "
+                f"code={business_code}"
+            )
 
 
 def run(args):
+    if args.limits <= 0:
+        raise ConfigurationError("--limits 必须大于 0")
+    if args.push_interval < 0:
+        raise ConfigurationError("--push-interval 不能小于 0")
+    if args.start_year > dt.datetime.now().year:
+        raise ConfigurationError("--start-year 不能晚于当前年份")
+    if not args.dry_run and not args.deepseek_model.strip():
+        raise ConfigurationError("DeepSeek 模型名称不能为空")
+
+    if args.dry_run:
+        api_key, feishu_urls = "", []
+    else:
+        api_key, feishu_urls = runtime_config()
+
     results = load_results(args.results)
-    confs = [conf.lower() for conf in parse_csv_env("CONFS", DEFAULT_CONFS)]
-    selected = find_and_update_papers(
+    state = load_state(args.state)
+    confs = [conf.lower() for conf in parse_csv(args.confs)]
+    if not confs:
+        raise ConfigurationError("--confs 至少需要一个会议名称")
+
+    selected = select_candidates(
         results=results,
-        conf_url=os.environ.get("CONF_URL", ""),
+        sent_paper_ids=state["sent_paper_ids"],
         limits=args.limits,
-        interval=args.interval,
         confs=confs,
         start_year=args.start_year,
-        dry_run=args.dry_run,
     )
-
     if not selected:
-        print("没有需要补全和推送的会议论文")
+        print("没有未推送且已包含摘要的会议论文")
         return 0
 
-    selected = apply_updates(results, selected, args.model_type, args.dry_run)
-    if not args.dry_run:
-        save_results(results, args.results)
+    if args.dry_run:
+        translations = ["[DRY_RUN] 未调用 DeepSeek" for _ in selected]
+    else:
+        translations = translate_with_deepseek(
+            [candidate["paper"]["paper_abstract"] for candidate in selected],
+            api_key,
+            args.deepseek_model,
+        )
+        if len(translations) != len(selected):
+            raise ConfDailyError("DeepSeek 返回的译文数量与待推送论文数量不一致")
 
-    feishu_urls = parse_csv_env("FEISHU_URL", [])
-    for index, (key, paper_index, _) in enumerate(tqdm(selected, desc="会议论文推送进度")):
-        paper = results[key][paper_index]
-        title, content = build_message(key, paper, index, args.model_type)
+    sent_ids = set(state["sent_paper_ids"])
+    for index, (candidate, translation) in enumerate(
+        zip(selected, translations), start=1
+    ):
+        title, content = build_message(
+            candidate["key"],
+            candidate["paper"],
+            index,
+            translation,
+            args.deepseek_model,
+        )
         send_feishu_message(title, content, feishu_urls, args.dry_run)
         if not args.dry_run:
+            sent_ids.add(candidate["paper_id"])
+            save_state(sent_ids, args.state)
+            print(f"已推送并记录第 {index}/{len(selected)} 篇会议论文")
+        if not args.dry_run and index < len(selected) and args.push_interval:
             time.sleep(args.push_interval)
+
+    if not args.dry_run:
+        print(f"成功推送并记录 {len(selected)} 篇会议论文")
 
     return 0
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Fill conference paper abstracts and send daily Feishu notifications."
+        description="Push unsent conference papers with existing abstracts to Feishu."
     )
     parser.add_argument("--results", type=Path, default=RESULTS_PATH)
+    parser.add_argument("--state", type=Path, default=STATE_PATH)
     parser.add_argument("--limits", type=int, default=int(os.environ.get("LIMITS", "10")))
-    parser.add_argument("--interval", type=int, default=int(os.environ.get("INTERVAL", "5")))
-    parser.add_argument("--push-interval", type=int, default=12)
+    parser.add_argument(
+        "--push-interval",
+        type=float,
+        default=float(os.environ.get("PUSH_INTERVAL", "5")),
+    )
     parser.add_argument("--start-year", type=int, default=2012)
-    parser.add_argument("--model-type", default=os.environ.get("MODEL_TYPE", "DeepSeek"))
+    parser.add_argument(
+        "--confs", default=os.environ.get("CONFS", ",".join(DEFAULT_CONFS))
+    )
+    parser.add_argument(
+        "--deepseek-model",
+        default=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+    )
     parser.add_argument("--dry-run", action="store_true", default=env_bool("DRY_RUN", False))
     return parser.parse_args()
 
 
 def main():
-    raise SystemExit(run(parse_args()))
+    try:
+        return run(parse_args())
+    except ConfDailyError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

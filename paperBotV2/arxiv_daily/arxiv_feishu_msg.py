@@ -2,6 +2,7 @@ import os
 import json
 import requests
 from datetime import datetime
+from urllib.parse import urlparse
 
 # 从环境变量获取配置，同时提供默认值
 # 支持多个飞书URL，使用逗号分隔
@@ -9,6 +10,60 @@ FEISHU_URLS = os.environ.get("FEISHU_URL", "").split(',')
 # 去除空字符串和空格
 FEISHU_URLS = [url.strip() for url in FEISHU_URLS if url.strip()]
 RETURN_PAPERS = int(os.environ.get("RETURN_PAPERS", "20"))
+CARD_TEXT_LIMIT = 800
+
+
+def format_card_text(value, default="N/A", limit=CARD_TEXT_LIMIT):
+    """Normalize and escape dynamic text before embedding it in lark_md."""
+    text = str(value if value not in (None, "") else default).strip()
+    text = " ".join(text.split())
+    for char in ("\\", "*", "_", "~", "`", "[", "]"):
+        text = text.replace(char, f"\\{char}")
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    return text
+
+
+def build_feishu_card(papers, date):
+    """Build a tenant-independent raw interactive card."""
+    elements = []
+    for index, paper in enumerate(papers, start=1):
+        title = format_card_text(paper.get('title'), limit=240)
+        translation = format_card_text(paper.get('translation'), limit=240)
+        score = paper.get('rerank_relevance_score', 'N/A')
+        summary = format_card_text(paper.get('summary'), limit=CARD_TEXT_LIMIT)
+        url = str(paper.get('url', '')).strip()
+        parsed_url = urlparse(url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            url = "https://arxiv.org"
+        score_text = f"{score} / 10" if isinstance(score, (int, float)) else "N/A"
+        content = (
+            f"**{index}. [{title}]({url})**\n"
+            f"**中文标题：** {translation}\n"
+            f"**推荐度：** {score_text}\n"
+            f"**摘要：** {summary}"
+        )
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": content,
+            },
+        })
+        if index < len(papers):
+            elements.append({"tag": "hr"})
+
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "template": "blue",
+            "title": {
+                "tag": "plain_text",
+                "content": f"arXiv 每日论文精选 · {date}",
+            },
+        },
+        "elements": elements,
+    }
 
 
 def get_latest_json_file(json_dir):
@@ -74,38 +129,7 @@ def send_papers_to_feishu(papers, feishu_urls=None):
         return
     
     date = datetime.now().strftime('%Y-%m-%d')
-    
-    card_data = {
-        "type": "template",
-        "data": {
-            "template_id": "AAqxH62u1uNko",
-            "template_version_name": "1.0.8",
-            "template_variable": {
-                "loop": [],
-                "date": date
-            }
-        }
-    }
-
-    for paper in papers:
-        title = paper['title']
-        translation = paper.get('translation', 'N/A')
-        score = paper.get('rerank_relevance_score', 'N/A')
-        summary = paper.get('summary', 'N/A')
-        url = paper['url']
-        
-        paper = f"[{title}]({url})"
-        score = "⭐️" * score + f" <text_tag color='blue'>{score}分</text_tag>" if isinstance(score, int) else "N/A"
-        
-        card_data['data']['template_variable']['loop'].append({
-            "paper": paper,
-            "translation": translation,
-            "score": score,
-            "summary": summary
-        })
-        
-    card = json.dumps(card_data)
-    body = json.dumps({"msg_type": "interactive", "card": card})
+    body = {"msg_type": "interactive", "card": build_feishu_card(papers, date)}
     headers = {"Content-Type": "application/json"}
     failures = []
     
@@ -113,32 +137,28 @@ def send_papers_to_feishu(papers, feishu_urls=None):
     for idx, url in enumerate(feishu_urls):
         send_label = f"[{idx+1}/{len(feishu_urls)}]"
         try:
-            ret = requests.post(url=url, data=body, headers=headers, timeout=10)
+            ret = requests.post(url=url, json=body, headers=headers, timeout=10)
             print(f"✉️ 飞书推送{send_label}返回状态: {ret.status_code}")
-            response_body = ret.text[:500]
             if not ret.ok:
-                failures.append(f"{send_label} HTTP失败: {ret.status_code}; body={response_body}")
+                failures.append(f"{send_label} HTTP失败: status={ret.status_code}")
                 continue
 
             try:
                 ret_data = ret.json()
-            except ValueError as e:
+            except ValueError:
                 failures.append(
-                    f"{send_label} 响应不是有效JSON: {e}; "
-                    f"HTTP {ret.status_code}; body={response_body}"
+                    f"{send_label} 响应不是有效JSON: HTTP {ret.status_code}"
                 )
                 continue
 
             status_code = ret_data.get("StatusCode", ret_data.get("code"))
             if status_code != 0:
-                status_msg = ret_data.get("StatusMessage", ret_data.get("msg", ""))
                 failures.append(
-                    f"{send_label} 业务失败: code={status_code}, "
-                    f"msg={status_msg}; body={response_body}"
+                    f"{send_label} 业务失败: code={status_code}"
                 )
                 continue
-        except requests.RequestException as e:
-            failures.append(f"{send_label} 请求失败: {e}")
+        except requests.RequestException as exc:
+            failures.append(f"{send_label} 请求失败: {type(exc).__name__}")
 
     if failures:
         for failure in failures:
@@ -156,7 +176,7 @@ def main():
     latest_json_file = get_latest_json_file(json_dir)
     if not latest_json_file:
         print("无法获取最新的JSON文件，程序退出")
-        return
+        return 0
     
     # 从文件名中提取日期并检查是否为今天
     latest_file_name = os.path.basename(latest_json_file)
@@ -170,7 +190,7 @@ def main():
             # 检查文件日期是否为今天
             if file_date.date() != today:
                 print(f"⚠️ 最新文件的日期 {file_date.date()} 不是今天 {today}，避免重复发送，程序退出")
-                return
+                return 0
         except ValueError:
             print(f"⚠️ 无法从文件名 {latest_file_name} 中解析日期，继续处理")
     
@@ -178,27 +198,29 @@ def main():
     papers = load_paper_data(latest_json_file)
     if not papers:
         print("未加载到论文数据，程序退出")
-        return
+        return 0
     
     # 按照精排分数排序并选择前N篇论文
     papers_with_score = [p for p in papers if 'rerank_relevance_score' in p and p.get('is_fine_ranked', False)]
     papers_with_score.sort(key=lambda x: x['rerank_relevance_score'], reverse=True)
     selected_papers = papers_with_score[:RETURN_PAPERS]
+
+    if not selected_papers:
+        print("⚠️ 没有符合条件的论文可以发送")
+        return 0
     
     # 检查是否有有效的飞书URL
     if not FEISHU_URLS:
         print("⚠️ 环境变量FEISHU_URL未设置或为空，无法发送飞书消息")
-        return
+        return 1
         
     print(f"📤 准备发送 {len(selected_papers)} 篇论文到 {len(FEISHU_URLS)} 个飞书URL...")
     
     # 发送到飞书
-    if selected_papers:
-        send_papers_to_feishu(selected_papers)
-        print("✅ 飞书消息发送完成！")
-    else:
-        print("⚠️ 没有符合条件的论文可以发送")
+    send_papers_to_feishu(selected_papers)
+    print("✅ 飞书消息发送完成！")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,77 +1,127 @@
 name: push_conf_daily
 
-env:
-  PYTHON_VERSION: "3.8" # set this to the Python version to use
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-on:      
+on:
+  schedule:
+    - cron: '17 8 * * *'
+      timezone: Asia/Shanghai
   workflow_dispatch:
-  # schedule:
-  #   - cron: '0 0 * * *' # 每天 UTC 时间 00:00 触发, 即上海时间08点 - 已禁用
+
+concurrency:
+  group: paperbot-main-writer-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.11"
 
 jobs:
   daily-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
-      SERVERCHAN_API_KEY: ${{ secrets.SERVERCHAN_API_KEY }}
-      CAIYUN_TOKEN: ${{ secrets.CAIYUN_TOKEN }}
-      CONF_URL: ${{ secrets.CONF_URL }}
-      FEISHU_URL: ${{ secrets.FEISHU_URL }}
-      INTERVAL: 5
-      LIMITS: 10
-      ERROR_LIMITS: 5
       DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      MODEL_TYPE: "DeepSeek"
-
-    permissions:
-      issues: write
-      contents: write
+      FEISHU_URL: ${{ secrets.FEISHU_URL }}
+      LIMITS: 10
+      PUSH_INTERVAL: 5
 
     steps:
-      - name: Debug time
-        run: |
-          echo "UTC:"
-          date -u
-          echo "Local:"
-          date
-          echo "Beijing:"
-          TZ=Asia/Shanghai date
-
-      - uses: actions/checkout@v3
+      - name: Checkout repository and LFS data
+        uses: actions/checkout@v7.0.1
         with:
+          ref: ${{ github.event.repository.default_branch }}
           lfs: true
-      - name: Set up Python version
-        uses: actions/setup-python@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v7.0.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
-
-      - name: PUSH CONF DAILY
+      - name: Push conference papers
+        id: conference_push
+        continue-on-error: true
+        shell: bash
         run: |
+          set +e
           python paperBotV2/conf_summary/conf_daily.py
-          cd paperBotV2/conf_summary
-          python convert_to_md.py
-          python update_readme_papers.py
-        
-      - name: Commit files
-        id: commit
+          push_exit_code=$?
+          echo "exit_code=$push_exit_code" >> "$GITHUB_OUTPUT"
+          exit "$push_exit_code"
+
+      - name: Commit and push state checkpoint
+        id: state_checkpoint
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
+          set -euo pipefail
+          state_path="paperBotV2/conf_summary/data/push_state.json"
+          if [[ ! -f "$state_path" ]]; then
+            echo "No conference push state file exists; nothing to checkpoint."
+            exit 0
+          fi
+
           git config --local user.email "action@github.com"
           git config --local user.name "github-actions"
-          git add --all
-          if [ -z "$(git status --porcelain)" ]; then
-             echo "push=false" >> "$GITHUB_OUTPUT"
-          else
-             git commit -m "chore: update confs" -a
-             echo "push=true" >> "$GITHUB_OUTPUT"
+          git add -- "$state_path"
+          if git diff --cached --quiet; then
+            echo "Conference push state is unchanged."
+            exit 0
           fi
-        shell: bash
 
-      - name: Push changes
-        if: steps.commit.outputs.push == 'true'
-        uses: ad-m/github-push-action@master
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          git commit -m "chore: update conference push state"
+
+          for attempt in 1 2 3; do
+            echo "Checkpoint push attempt $attempt/3"
+            if ! git fetch origin \
+              "$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH"; then
+              echo "Fetch failed on attempt $attempt/3."
+              continue
+            fi
+            if ! git rebase "origin/$TARGET_BRANCH"; then
+              git rebase --abort || true
+              echo "Unable to rebase the conference state checkpoint."
+              exit 1
+            fi
+            if git push origin "HEAD:$TARGET_BRANCH"; then
+              exit 0
+            fi
+            echo "Push was rejected on attempt $attempt/3; retrying."
+          done
+
+          echo "Unable to persist the conference state checkpoint after 3 attempts."
+          exit 1
+
+      - name: Preserve conference push result
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PUSH_OUTCOME: ${{ steps.conference_push.outcome }}
+          PUSH_EXIT_CODE: ${{ steps.conference_push.outputs.exit_code }}
+          CHECKPOINT_OUTCOME: ${{ steps.state_checkpoint.outcome }}
+        run: |
+          set -u
+          if [[ "$PUSH_OUTCOME" != "success" ]]; then
+            exit_code="${PUSH_EXIT_CODE:-1}"
+            if [[ ! "$exit_code" =~ ^[0-9]+$ ]] || (( exit_code == 0 )); then
+              exit_code=1
+            fi
+            echo "Conference paper push failed with exit code $exit_code."
+            if [[ "$CHECKPOINT_OUTCOME" != "success" ]]; then
+              echo "State checkpoint persistence also failed."
+            fi
+            exit "$exit_code"
+          fi
+
+          if [[ "$CHECKPOINT_OUTCOME" != "success" ]]; then
+            echo "Conference paper push succeeded, but state checkpoint persistence failed."
+            exit 1
+          fi
+
+          echo "Conference paper push and state checkpoint persistence succeeded."

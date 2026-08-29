@@ -172,15 +172,19 @@ def load_paper_data(file_path):
         file_path: JSON文件路径
     
     Returns:
-        list: 论文数据列表
+        list: 论文数据列表；读取或格式错误时返回None
     """
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("论文JSON顶层必须是对象")
         
         # 转换为列表并添加arxiv_id字段；避免原地修改JSON解析出的子对象
         papers = []
         for arxiv_id, paper_info in data.items():
+            if not isinstance(paper_info, dict):
+                raise ValueError(f"论文 {arxiv_id} 的数据必须是对象")
             paper = dict(paper_info)
             paper['arxiv_id'] = arxiv_id
             papers.append(paper)
@@ -188,7 +192,7 @@ def load_paper_data(file_path):
         return papers
     except Exception as e:
         print(f"加载论文数据失败: {e}")
-        return []
+        return None
 
 
 def read_frontend_file(directory, file_name):
@@ -1027,34 +1031,41 @@ def main():
     
     if args.all and args.date:
         print("--all 与 --date 不能同时使用")
-        return
+        return 2
     if args.all and args.output:
         print("--all 不支持同时指定 --output")
-        return
+        return 2
 
     if args.all:
         json_files = get_all_json_files(json_dir)
         if not json_files:
             print("未找到可回溯生成的日期JSON文件，程序退出")
-            return
+            return 1
         success_count = 0
+        failed_dates = []
         for json_file in json_files:
             date_str = os.path.basename(json_file).split('.')[0]
             papers = load_paper_data(json_file)
-            if not papers:
-                print(f"日期 {date_str} 未加载到论文数据，跳过")
+            if papers is None:
+                print(f"日期 {date_str} 的论文数据加载失败，跳过")
+                failed_dates.append(date_str)
                 continue
             if generate_html(papers, date_str, script_dir):
                 success_count += 1
+            else:
+                failed_dates.append(date_str)
         print(f"批量生成完成：成功 {success_count}/{len(json_files)} 个日期")
-        return
+        if failed_dates:
+            print(f"以下日期生成失败: {', '.join(failed_dates)}")
+            return 1
+        return 0
 
     # 获取JSON文件路径
     if args.date:
         date_arg = sanitize_date(args.date)
         if not date_arg:
             print("日期格式无效，应为YYYYMMDD")
-            return
+            return 2
         json_file = get_json_file_by_date(json_dir, date_arg)
     else:
         date_arg = None
@@ -1062,18 +1073,20 @@ def main():
     
     if not json_file:
         print("无法获取JSON文件，程序退出")
-        return
+        return 1
     
     # 加载论文数据
     papers = load_paper_data(json_file)
-    if not papers:
-        print("未加载到论文数据，程序退出")
-        return
+    if papers is None:
+        print("论文数据加载失败，程序退出")
+        return 1
     
     # 生成HTML页面
     date_str = date_arg if date_arg else os.path.basename(json_file).split('.')[0]
-    generate_html(papers, date_str, script_dir, args.output)
+    if not generate_html(papers, date_str, script_dir, args.output):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

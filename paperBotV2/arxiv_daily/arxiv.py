@@ -5,6 +5,7 @@ import json
 import time
 import feedparser
 import random
+import tempfile
 from openai import OpenAI
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,8 +16,6 @@ from .prompts import PRERANK_PROMPT, FINERANK_PROMPT
 from .status import ArxivDailyStatus
 
 # 从环境变量获取配置，同时提供默认值
-# 支持多个飞书URL，用逗号分隔
-FEISHU_URLS = [url.strip() for url in os.environ.get("FEISHU_URL", "").split(',') if url.strip()]
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", None)
 # TARGET_CATEGORYS 使用逗号分隔的字符串格式
 TARGET_CATEGORYS = os.environ.get("TARGET_CATEGORYS", "cs.IR,cs.CL,cs.CV")
@@ -47,12 +46,18 @@ ARXIV_API_BASE_URLS = [
 ARXIV_USER_AGENT = os.environ.get(
     "ARXIV_USER_AGENT",
     "Algorithm-Practice-in-Industry paperBotV2 arxiv_daily; "
-    "https://github.com/Doragd/Algorithm-Practice-in-Industry",
+    "https://github.com/zdrjson/Algorithm-Practice-in-Industry",
 )
 
 
 class ArxivFetchError(RuntimeError):
     """Raised when arXiv data cannot be fetched reliably."""
+
+
+def validate_runtime_configuration():
+    """Validate required configuration before any network or ranking work starts."""
+    if not DEEPSEEK_API_KEY or not DEEPSEEK_API_KEY.strip():
+        raise RuntimeError("DEEPSEEK_API_KEY is required for arXiv ranking")
 
 
 def parse_category_max_pages(raw_config):
@@ -443,60 +448,6 @@ def fine_rank_papers(papers, max_workers=10, paper_count=5):
     return analyzed_papers
 
 
-def send_papers_to_feishu(papers, feishu_urls=None):
-    # 如果没有指定URL列表，使用默认的FEISHU_URLS
-    if feishu_urls is None:
-        feishu_urls = FEISHU_URLS
-    
-    # 如果没有设置飞书URL，跳过发送
-    if not feishu_urls:
-        print("[-] 没有设置飞书URL，跳过发送消息")
-        return
-    
-    date = datetime.now().strftime('%Y-%m-%d')
-    
-    card_data = {
-        "type": "template",
-        "data": {
-            "template_id": "AAqxH62u1uNko",
-            "template_version_name": "1.0.5",
-            "template_variable": {
-                "loop": [],
-                "date": date
-            }
-        }
-    }
-
-    for paper in papers:
-        title = paper['title']
-        translation = paper.get('translation', 'N/A')
-        score = paper.get('rerank_relevance_score', 'N/A')
-        summary = paper.get('summary', 'N/A')
-        url = paper['url']
-        
-        paper_formatted = f"[{title}]({url})"
-        score_formatted = "⭐️" * score + f" <text_tag color='blue'>{score}分</text_tag>" if isinstance(score, int) else "N/A"
-        
-        card_data['data']['template_variable']['loop'].append({
-            "paper": paper_formatted,
-            "translation": translation,
-            "score": score_formatted,
-            "summary": summary
-        })
-        
-    card = json.dumps(card_data)
-    body = json.dumps({"msg_type": "interactive", "card": card})
-    headers = {"Content-Type": "application/json"}
-    
-    # 循环发送到所有飞书URL
-    for idx, url in enumerate(feishu_urls):
-        try:
-            # 设置超时时间为10秒
-            ret = requests.post(url=url, data=body, headers=headers, timeout=10)
-            print(f"✉️ 飞书推送[{idx+1}/{len(feishu_urls)}]返回状态: {ret.status_code}")
-        except Exception as e:
-            print(f"❌ 飞书推送[{idx+1}/{len(feishu_urls)}]失败: {e}")
-
 def get_papers_from_all_categories(run_status=None):
     """从所有指定分类获取论文并初始化状态标记，去除与前一天重复的论文"""
     all_papers = {}
@@ -581,6 +532,10 @@ def perform_rough_ranking(all_papers, run_status=None):
             success=len(analyzed_papers),
             scores=[paper.get('relevance_score', 0) for paper in analyzed_papers],
         )
+    if all_papers and not analyzed_papers:
+        raise RuntimeError(
+            f"Rough ranking failed for all {len(all_papers)} fetched papers"
+        )
     
     # 更新all_papers中的论文信息并标记过滤状态
     for paper in filtered_papers:
@@ -606,6 +561,11 @@ def perform_fine_ranking(filtered_papers, all_papers, run_status=None):
             success=len(final_papers),
             scores=[paper.get('rerank_relevance_score', 0) for paper in final_papers],
         )
+    attempted_papers = min(len(filtered_papers), RETURN_PAPERS)
+    if attempted_papers and not final_papers:
+        raise RuntimeError(
+            f"Fine ranking failed for all {attempted_papers} selected papers"
+        )
     
     for paper in final_papers:
         arxiv_id = paper['arxiv_id']
@@ -616,13 +576,50 @@ def perform_fine_ranking(filtered_papers, all_papers, run_status=None):
     return final_papers
 
 
+def _atomic_write_json(file_path, data):
+    """Write JSON beside the destination and replace it only after a complete flush."""
+    directory = os.path.dirname(file_path)
+    os.makedirs(directory, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=directory,
+            prefix=f".{os.path.basename(file_path)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+            json.dump(data, temp_file, ensure_ascii=False, indent=2)
+            temp_file.write("\n")
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        os.replace(temp_path, file_path)
+    except Exception:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
+
+
+def _load_existing_results(file_path):
+    if not os.path.exists(file_path):
+        return {}
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            results = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"Cannot safely update results.json: existing file could not be read "
+            f"({type(exc).__name__})"
+        ) from exc
+    if not isinstance(results, dict):
+        raise ValueError("Cannot safely update results.json: expected a JSON object")
+    return results
+
+
 def save_results_to_json(all_papers):
     """保存所有结果到指定路径的JSON文件，包括天级文件和全量文件"""
-    # 如果没有新论文，直接返回
-    if not all_papers:
-        print("📭 今天没有新论文，跳过保存JSON文件")
-        return False
-    
     # 获取当前脚本所在目录（paperBotV2/arxiv_daily目录）
     current_dir = os.path.dirname(os.path.abspath(__file__))
     
@@ -631,25 +628,14 @@ def save_results_to_json(all_papers):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     
-    # 1. 保存当天的结果到日期格式的文件
-    daily_file = os.path.join(save_dir, f"{datetime.now().strftime('%Y%m%d')}.json")
-    with open(daily_file, 'w', encoding='utf-8') as f:
-        json.dump(all_papers, f, ensure_ascii=False, indent=2)
-    
-    print(f"💾 当天论文结果已保存到 {daily_file}")
-    
-    # 2. 保存/更新全量results.json文件
+    if not isinstance(all_papers, dict):
+        raise ValueError("Daily arXiv results must be a JSON object")
+
+    # 先验证全量文件。已有文件损坏时必须中止，不能把它当作空数据覆盖。
     all_results_file = os.path.join(save_dir, "results.json")
-    
-    # 读取已有全量结果（如果存在）
-    all_results = {}
+    all_results = _load_existing_results(all_results_file)
     if os.path.exists(all_results_file):
-        try:
-            with open(all_results_file, 'r', encoding='utf-8') as f:
-                all_results = json.load(f)
-            print(f"📋 已加载现有全量结果，共 {len(all_results)} 篇论文。")
-        except Exception as e:
-            print(f"❌ 读取全量结果文件失败: {e}")
+        print(f"📋 已加载现有全量结果，共 {len(all_results)} 篇论文。")
     
     # 增量更新全量结果（使用arxiv_id作为唯一标识）
     new_papers_count = 0
@@ -658,9 +644,14 @@ def save_results_to_json(all_papers):
             all_results[arxiv_id] = paper
             new_papers_count += 1
     
-    # 保存更新后的全量结果
-    with open(all_results_file, 'w', encoding='utf-8') as f:
-        json.dump(all_results, f, ensure_ascii=False, indent=2)
+    # 每个文件都通过同目录临时文件原子替换，避免中断时留下截断 JSON。
+    daily_file = os.path.join(save_dir, f"{datetime.now().strftime('%Y%m%d')}.json")
+    _atomic_write_json(daily_file, all_papers)
+    print(f"💾 当天论文结果已保存到 {daily_file}")
+    if not all_papers:
+        print("📭 今天没有新论文，已保存空的当天结果")
+
+    _atomic_write_json(all_results_file, all_results)
     
     print(f"📊 全量结果已更新到 {all_results_file}，新增 {new_papers_count} 篇论文，总论文数: {len(all_results)}")
     return True
@@ -670,6 +661,9 @@ def process_papers():
     """处理并保存论文的主函数 - 协调各个子函数的执行"""
     run_status = ArxivDailyStatus()
     try:
+        run_status.update_stage("validate")
+        validate_runtime_configuration()
+
         # 1. 获取论文
         run_status.update_stage("fetch")
         all_papers = get_papers_from_all_categories(run_status=run_status)

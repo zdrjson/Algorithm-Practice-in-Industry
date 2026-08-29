@@ -3,17 +3,18 @@ name: arxiv_daily_full
 on:
   # 定时触发
   schedule:
-    # 每天UTC时间3:23（北京时间11:23）执行，避开整点和高峰自动任务
-    - cron: '23 3 * * *'
+    # 每天北京时间11:23执行，避开整点和高峰自动任务
+    - cron: '23 11 * * *'
+      timezone: Asia/Shanghai
   # 手动触发
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: true
+  group: paperbot-main-writer-${{ github.repository }}
+  cancel-in-progress: false
 
 env:
-  PYTHON_VERSION: "3.8"
+  PYTHON_VERSION: "3.11"
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
@@ -21,10 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     permissions:
-      issues: write
       contents: write
-      pages: write
-      id-token: write
     steps:
       - name: Debug time
         run: |
@@ -37,15 +35,13 @@ jobs:
 
       # 检出代码
       - name: Checkout repository
-        uses: actions/checkout@v3
-        with:
-          lfs: true
+        uses: actions/checkout@v7.0.1
 
       # 设置Python环境
-      - name: Set up Python 3.8
-        uses: actions/setup-python@v4
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7.0.0
         with:
-          python-version: '3.8'
+          python-version: ${{ env.PYTHON_VERSION }}
 
       # 安装依赖
       - name: Install dependencies
@@ -89,6 +85,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ -z "${DEEPSEEK_API_KEY//[[:space:]]/}" ]]; then
+            echo "❌ DEEPSEEK_API_KEY 未配置，停止执行且不进行重试"
+            exit 1
+          fi
+
           max_attempts=3
           for attempt in $(seq 1 "$max_attempts"); do
             echo "🚀 arxiv.py workflow 外层尝试 ${attempt}/${max_attempts}"
@@ -96,9 +97,10 @@ jobs:
             if python -m paperBotV2.arxiv_daily.arxiv; then
               echo "✅ arxiv.py 执行成功"
               exit 0
+            else
+              exit_code=$?
             fi
 
-            exit_code=$?
             if [ "$attempt" -eq "$max_attempts" ]; then
               echo "❌ arxiv.py 已达到 workflow 外层最大重试次数，最终失败"
               exit "$exit_code"
@@ -117,18 +119,47 @@ jobs:
       # 生成HTML页面
       - name: Generate HTML pages
         run: |
-          cd paperBotV2/arxiv_daily
-          python generate_arxiv_html.py
+          run_date="$(python -c 'from paperBotV2.arxiv_daily.status import today_key; print(today_key())')"
+          python paperBotV2/arxiv_daily/generate_arxiv_html.py --date "$run_date"
         env:
           # 确保脚本可以找到JSON文件
           PYTHONPATH: ${{ github.workspace }}
 
-      - name: Mark HTML generated
+      - name: Validate generated files
         run: |
           python - <<'PY'
-          from paperBotV2.arxiv_daily.status import update_today_output
-          updated = update_today_output(html_generated=True)
-          print(f"HTML generated status updated: {updated}")
+          import os
+          from pathlib import Path
+
+          from paperBotV2.arxiv_daily.status import (
+              latest_status_for_date,
+              today_key,
+          )
+
+          date_key = today_key()
+          status = latest_status_for_date(date_key)
+          if not status:
+              raise SystemExit(f"Missing status for {date_key}")
+
+          expected_run_id = os.environ.get("GITHUB_RUN_ID", "")
+          if expected_run_id and status.get("run_id") != expected_run_id:
+              raise SystemExit(
+                  f"Status belongs to run {status.get('run_id')}, expected {expected_run_id}"
+              )
+          if status.get("status") != "success":
+              raise SystemExit(f"Current arXiv status is not successful: {status.get('status')}")
+          if not status.get("output", {}).get("daily_json_written"):
+              raise SystemExit("Current arXiv run did not write its daily JSON")
+
+          expected_files = [
+              Path(f"paperBotV2/arxiv_daily/data/{date_key}.json"),
+              Path(f"paperBotV2/arxiv_daily/output/arxiv_{date_key}.html"),
+              Path("paperBotV2/arxiv_daily/output/index.html"),
+          ]
+          missing = [str(path) for path in expected_files if not path.is_file() or path.stat().st_size == 0]
+          if missing:
+              raise SystemExit(f"Missing or empty expected output files: {', '.join(missing)}")
+          print(f"Generated files validated for {date_key}")
           PY
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -159,13 +190,13 @@ jobs:
       # Push changes
       - name: Push changes
         if: steps.commit.outputs.push == 'true'
-        uses: ad-m/github-push-action@master
+        uses: ad-m/github-push-action@v1.3.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
       # 创建或更新gh-pages分支
       - name: Deploy to GitHub Pages
-        uses: peaceiris/actions-gh-pages@v3
+        uses: peaceiris/actions-gh-pages@v4.1.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./paperBotV2/arxiv_daily/output
@@ -175,9 +206,59 @@ jobs:
           full_commit_message: "docs: update arXiv papers HTML pages ${{ github.sha }}"
           force_orphan: false
 
+      - name: Mark Pages deployment successful
+        run: |
+          python - <<'PY'
+          import os
+
+          from paperBotV2.arxiv_daily.status import (
+              latest_status_for_date,
+              today_key,
+              update_today_output,
+          )
+
+          date_key = today_key()
+          status = latest_status_for_date(date_key)
+          if not status:
+              raise SystemExit(f"Missing status for {date_key}")
+
+          expected_run_id = os.environ.get("GITHUB_RUN_ID", "")
+          if expected_run_id and status.get("run_id") != expected_run_id:
+              raise SystemExit(
+                  f"Status belongs to run {status.get('run_id')}, expected {expected_run_id}"
+              )
+          if not update_today_output(html_generated=True):
+              raise SystemExit(f"Failed to update Pages status for {date_key}")
+          updated_status = latest_status_for_date(date_key)
+          if not updated_status.get("output", {}).get("html_generated"):
+              raise SystemExit(f"Pages status was not persisted for {date_key}")
+          print(f"Pages deployment status updated for {date_key}")
+          PY
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+      - name: Commit successful deployment status
+        id: deployment_status_commit
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "github-actions"
+          git add paperBotV2/arxiv_daily/status/
+          if [ -z "$(git status --porcelain -- paperBotV2/arxiv_daily/status/)" ]; then
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          else
+            git commit -m "chore: mark arxiv Pages deployment successful"
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Push successful deployment status
+        if: steps.deployment_status_commit.outputs.push == 'true'
+        uses: ad-m/github-push-action@v1.3.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
       # 更新README或其他地方的链接，指向最新的HTML页面
       - name: Update latest paper link
-        if: always()
         run: |
           # 获取最新的HTML文件名
           LATEST_HTML=$(ls -t paperBotV2/arxiv_daily/output/*.html 2>/dev/null | head -n 1)
@@ -197,6 +278,22 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "github-actions"
+          python - <<'PY'
+          import os
+
+          from paperBotV2.arxiv_daily.status import (
+              latest_status_for_date,
+              today_key,
+              update_today_output,
+          )
+
+          date_key = today_key()
+          status = latest_status_for_date(date_key)
+          expected_run_id = os.environ.get("GITHUB_RUN_ID", "")
+          if status and (not expected_run_id or status.get("run_id") == expected_run_id):
+              update_today_output(html_generated=False)
+              print(f"Pages deployment status reset for failed run {expected_run_id}")
+          PY
           if [ -d paperBotV2/arxiv_daily/status ]; then
             git add paperBotV2/arxiv_daily/status/
           fi
@@ -207,9 +304,11 @@ jobs:
             echo "push=true" >> "$GITHUB_OUTPUT"
           fi
         shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}
 
       - name: Push status on failure
         if: failure() && steps.failure_status_commit.outputs.push == 'true'
-        uses: ad-m/github-push-action@master
+        uses: ad-m/github-push-action@v1.3.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
